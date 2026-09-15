@@ -1,0 +1,387 @@
+#!/bin/bash
+#
+# safari-profile - open a URL in a specific Safari profile.
+#
+# Safari's AppleScript dictionary knows nothing about profiles, but when more than one
+# profile exists Safari prefixes every window title with the profile name and an em dash
+# (U+2014), so a window of profile "Work" showing example.com is titled:
+#   Work [U+2014] Example Domain
+# That prefix is how a window's profile is identified here.
+# Creating a window in a given profile is only reachable through the menu bar
+# (File > New Window > "New <Profile> Window"), which needs Accessibility permission.
+
+set -euo pipefail
+
+PROGRAM=${0##*/}
+
+# Exit codes
+E_USAGE=1
+E_PROFILE=2
+E_SAFARI=3
+
+usage() {
+    cat <<EOF
+Usage:
+  $PROGRAM <profile> <url>      open <url> in Safari profile <profile>
+  $PROGRAM --dry-run <profile> <url>
+                                report what would be done, change nothing
+  $PROGRAM --list               list the available Safari profiles
+  $PROGRAM --help               show this help
+
+Behaviour:
+  * no window of <profile>          -> open a new window in that profile with <url>
+  * a tab with <url> already open   -> switch to that window and tab
+  * otherwise                       -> new tab in the profile's frontmost window
+
+URLs are compared after normalization: the scheme and host are case-folded, the
+"#fragment" and a default port (:80 for http, :443 for https) are dropped, and a
+single trailing "/" is removed.
+
+Exit codes: 0 ok, $E_USAGE usage error, $E_PROFILE unknown profile, $E_SAFARI Safari/AppleScript failure.
+EOF
+}
+
+die() { printf '%s: %s\n' "$PROGRAM" "$1" >&2; exit "${2:-$E_SAFARI}"; }
+
+# Turn an AppleScript failure into an actionable message.
+report_osascript_error() {
+    local err=$1
+    case $err in
+        *NOSUBMENU*)
+            die "Safari's File > New Window has no profile submenu; this Safari has only one profile." "$E_PROFILE"
+            ;;
+        *NOPROFILE:*)
+            local found=${err##*NOPROFILE:}
+            found=${found%%$'\n'*}
+            found=${found%% (-[0-9]*)}
+            die "unknown profile \"${profile}\". Available: ${found}" "$E_PROFILE"
+            ;;
+        *-1719*|*-25211*|*"not allowed assistive"*|*"not allowed to send keystrokes"*)
+            die "Accessibility permission is required to open a new profile window.
+Grant it to your terminal in System Settings > Privacy & Security > Accessibility."
+            ;;
+        *TIMEOUT*)
+            die "timed out waiting for the new Safari window to appear."
+            ;;
+        *)
+            die "AppleScript failed: ${err}"
+            ;;
+    esac
+}
+
+# ---------------------------------------------------------------------------
+# AppleScript stages. Each one reads its arguments from argv, so no shell value
+# is ever interpolated into AppleScript source.
+# ---------------------------------------------------------------------------
+
+# Emits, for every window belonging to the given profile:
+#   W<TAB><window id><TAB><window index>
+#   T<TAB><window id><TAB><tab index><TAB><tab URL>
+as_inventory() {
+    osascript - "$1" <<'EOS'
+on run argv
+    set p to item 1 of argv
+    set sep to p & " " & (character id 8212) & " "
+    set sepLen to length of sep
+    -- literal tab: inside a Safari tell block the word `tab` names a class, not the character
+    set TC to (character id 9)
+    set out to {}
+    tell application "Safari"
+        repeat with w in windows
+            set wname to ""
+            try
+                set wname to name of w
+            end try
+            set isMine to false
+            if wname is p then
+                set isMine to true
+            else if (length of wname) is greater than or equal to sepLen then
+                if (text 1 thru sepLen of wname) is sep then set isMine to true
+            end if
+            if isMine then
+                try
+                    set wid to (id of w) as text
+                    set widx to (index of w) as text
+                    set end of out to "W" & TC & wid & TC & widx
+                    repeat with t in tabs of w
+                        set turl to ""
+                        try
+                            set turl to (URL of t) as text
+                        end try
+                        set end of out to "T" & TC & wid & TC & ((index of t) as text) & TC & turl
+                    end repeat
+                end try
+            end if
+        end repeat
+    end tell
+    set AppleScript's text item delimiters to linefeed
+    set res to out as text
+    set AppleScript's text item delimiters to ""
+    return res
+end run
+EOS
+}
+
+# Focus an existing tab: <window id> <tab index>
+as_focus() {
+    osascript - "$1" "$2" <<'EOS'
+on run argv
+    set wid to (item 1 of argv) as integer
+    set tidx to (item 2 of argv) as integer
+    tell application "Safari"
+        set w to window id wid
+        if miniaturized of w then set miniaturized of w to false
+        set current tab of w to tab tidx of w
+        set index of w to 1
+        activate
+    end tell
+end run
+EOS
+}
+
+# Open a new tab in an existing window: <window id> <url>
+as_newtab() {
+    osascript - "$1" "$2" <<'EOS'
+on run argv
+    set wid to (item 1 of argv) as integer
+    set theURL to item 2 of argv
+    tell application "Safari"
+        set w to window id wid
+        if miniaturized of w then set miniaturized of w to false
+        set t to make new tab at end of tabs of w with properties {URL:theURL}
+        set current tab of w to t
+        set index of w to 1
+        activate
+    end tell
+end run
+EOS
+}
+
+# Open a new window in a profile via the menu bar: <profile> <url>
+as_newwindow() {
+    osascript - "$1" "$2" <<'EOS'
+on run argv
+    set p to item 1 of argv
+    set theURL to item 2 of argv
+
+    tell application "Safari" to activate
+    set oldIDs to {}
+    tell application "Safari"
+        repeat with w in windows
+            set end of oldIDs to (id of w)
+        end repeat
+    end tell
+
+    set wanted to "New " & p & " Window"
+    tell application "System Events"
+        tell process "Safari"
+            set fileMenu to menu 1 of menu bar item "File" of menu bar 1
+            try
+                set newWindowItem to menu item "New Window" of fileMenu
+                set sub to menu 1 of newWindowItem
+                set itemNames to name of menu items of sub
+            on error
+                error "NOSUBMENU"
+            end try
+            set chosen to missing value
+            repeat with n in itemNames
+                if (n as text) is wanted then set chosen to (n as text)
+            end repeat
+            if chosen is missing value then
+                repeat with n in itemNames
+                    if (n as text) contains p then set chosen to (n as text)
+                end repeat
+            end if
+            if chosen is missing value then
+                set profileNames to {}
+                repeat with n in itemNames
+                    set nm to n as text
+                    if nm starts with "New " and nm ends with " Window" then set nm to text 5 thru ((length of nm) - 7) of nm
+                    set end of profileNames to nm
+                end repeat
+                set AppleScript's text item delimiters to ", "
+                set joined to profileNames as text
+                set AppleScript's text item delimiters to ""
+                error "NOPROFILE:" & joined
+            end if
+            click menu item chosen of sub
+        end tell
+    end tell
+
+    set deadline to (current date) + 10
+    repeat
+        tell application "Safari"
+            repeat with w in windows
+                set wid to (id of w)
+                if oldIDs does not contain wid then
+                    set URL of current tab of w to theURL
+                    if miniaturized of w then set miniaturized of w to false
+                    set index of w to 1
+                    activate
+                    return "ok"
+                end if
+            end repeat
+        end tell
+        if (current date) is greater than deadline then error "TIMEOUT"
+        delay 0.1
+    end repeat
+end run
+EOS
+}
+
+# Print the profile names offered by File > New Window.
+as_list_profiles() {
+    osascript - <<'EOS'
+on run argv
+    tell application "Safari" to activate
+    tell application "System Events"
+        tell process "Safari"
+            set fileMenu to menu 1 of menu bar item "File" of menu bar 1
+            try
+                set sub to menu 1 of menu item "New Window" of fileMenu
+                set itemNames to name of menu items of sub
+            on error
+                error "NOSUBMENU"
+            end try
+        end tell
+    end tell
+    set out to {}
+    repeat with n in itemNames
+        set nm to n as text
+        if nm starts with "New " and nm ends with " Window" then
+            set nm to text 5 thru ((length of nm) - 7) of nm
+        end if
+        set end of out to nm
+    end repeat
+    set AppleScript's text item delimiters to linefeed
+    set res to out as text
+    set AppleScript's text item delimiters to ""
+    return res
+end run
+EOS
+}
+
+ensure_safari_running() {
+    if osascript -e 'tell application "System Events" to (name of processes) contains "Safari"' 2>/dev/null | grep -q true; then
+        return 0
+    fi
+    open -a Safari || die "could not launch Safari."
+    local i=0
+    while [ "$i" -lt 100 ]; do
+        if osascript -e 'tell application "System Events" to (name of processes) contains "Safari"' 2>/dev/null | grep -q true; then
+            return 0
+        fi
+        i=$((i + 1))
+        /bin/sleep 0.1
+    done
+    die "Safari did not start in time."
+}
+
+# ---------------------------------------------------------------------------
+# Argument parsing
+# ---------------------------------------------------------------------------
+
+dry_run=0
+action=open
+
+while [ $# -gt 0 ]; do
+    case $1 in
+        -h|--help) usage; exit 0 ;;
+        --list) action=list; shift ;;
+        -n|--dry-run) dry_run=1; shift ;;
+        --) shift; break ;;
+        -*) die "unknown option: $1" "$E_USAGE" ;;
+        *) break ;;
+    esac
+done
+
+if [ "$action" = list ]; then
+    [ $# -eq 0 ] || die "--list takes no arguments." "$E_USAGE"
+    ensure_safari_running
+    if ! out=$(as_list_profiles 2>&1); then
+        report_osascript_error "$out"
+    fi
+    printf '%s\n' "$out"
+    exit 0
+fi
+
+[ $# -eq 2 ] || { usage >&2; exit "$E_USAGE"; }
+
+profile=$1
+url=$2
+
+case $url in
+    [a-zA-Z]*:*) : ;;
+    *) die "not a URL (missing scheme): $url" "$E_USAGE" ;;
+esac
+
+# ---------------------------------------------------------------------------
+# Main flow
+# ---------------------------------------------------------------------------
+
+ensure_safari_running
+
+if ! inventory=$(as_inventory "$profile" 2>&1); then
+    report_osascript_error "$inventory"
+fi
+
+# Find the profile's frontmost window and the first tab whose normalized URL matches.
+result=$(printf '%s\n' "$inventory" | awk -F'\t' -v target="$url" '
+function norm(u,   i, p, scheme, rest, auth, path) {
+    sub(/#.*/, "", u)
+    i = index(u, "://")
+    if (i > 0) {
+        scheme = tolower(substr(u, 1, i - 1))
+        rest = substr(u, i + 3)
+        p = index(rest, "/")
+        if (p > 0) { auth = substr(rest, 1, p - 1); path = substr(rest, p) }
+        else       { auth = rest; path = "" }
+        auth = tolower(auth)
+        if (scheme == "http")  sub(/:80$/,  "", auth)
+        if (scheme == "https") sub(/:443$/, "", auth)
+        u = scheme "://" auth path
+    }
+    if (length(u) > 1 && substr(u, length(u)) == "/") u = substr(u, 1, length(u) - 1)
+    return u
+}
+BEGIN { t = norm(target); frontIdx = -1; matchIdx = -1 }
+$1 == "W" { widx[$2] = $3 + 0; if (frontIdx < 0 || $3 + 0 < frontIdx) { frontIdx = $3 + 0; frontID = $2 } }
+$1 == "T" {
+    if (matchIdx >= 0 && widx[$2] >= matchIdx) next
+    if (norm($4) == t) { matchIdx = widx[$2]; mWin = $2; mTab = $3 }
+}
+END {
+    if (frontIdx >= 0) print "front " frontID
+    if (matchIdx >= 0) print "match " mWin " " mTab
+}
+')
+
+front_id=$(printf '%s\n' "$result" | awk '$1 == "front" { print $2 }')
+match_win=$(printf '%s\n' "$result" | awk '$1 == "match" { print $2 }')
+match_tab=$(printf '%s\n' "$result" | awk '$1 == "match" { print $3 }')
+
+if [ -n "$match_win" ]; then
+    if [ "$dry_run" = 1 ]; then
+        printf 'focus existing tab %s in window %s (profile %s)\n' "$match_tab" "$match_win" "$profile"
+        exit 0
+    fi
+    if ! out=$(as_focus "$match_win" "$match_tab" 2>&1); then
+        report_osascript_error "$out"
+    fi
+elif [ -n "$front_id" ]; then
+    if [ "$dry_run" = 1 ]; then
+        printf 'open new tab in window %s (profile %s)\n' "$front_id" "$profile"
+        exit 0
+    fi
+    if ! out=$(as_newtab "$front_id" "$url" 2>&1); then
+        report_osascript_error "$out"
+    fi
+else
+    if [ "$dry_run" = 1 ]; then
+        printf 'open new window for profile %s\n' "$profile"
+        exit 0
+    fi
+    if ! out=$(as_newwindow "$profile" "$url" 2>&1); then
+        report_osascript_error "$out"
+    fi
+fi
