@@ -58,10 +58,15 @@ report_osascript_error() {
             ;;
         *-1719*|*-25211*|*"not allowed assistive"*|*"not allowed to send keystrokes"*)
             die "Accessibility permission is required to open a new profile window.
-Grant it to your terminal in System Settings > Privacy & Security > Accessibility."
+Grant it to whatever runs this script (your terminal, or the Velja helper app)
+in System Settings > Privacy & Security > Accessibility."
             ;;
         *TIMEOUT*)
             die "timed out waiting for the new Safari window to appear."
+            ;;
+        *-600*)
+            die "System Events is not responding (it may be hung or stopped).
+Restart it with: killall -9 \"System Events\""
             ;;
         *)
             die "AppleScript failed: ${err}"
@@ -262,13 +267,13 @@ EOS
 }
 
 ensure_safari_running() {
-    if osascript -e 'tell application "System Events" to (name of processes) contains "Safari"' 2>/dev/null | grep -q true; then
+    if osascript -e 'application "Safari" is running' 2>/dev/null | grep -q true; then
         return 0
     fi
     open -a Safari || die "could not launch Safari."
     local i=0
     while [ "$i" -lt 100 ]; do
-        if osascript -e 'tell application "System Events" to (name of processes) contains "Safari"' 2>/dev/null | grep -q true; then
+        if osascript -e 'application "Safari" is running' 2>/dev/null | grep -q true; then
             return 0
         fi
         i=$((i + 1))
